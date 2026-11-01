@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地配置含 SMTP 密码，不入库。参照 config.example.toml 自行创建。
+config.toml
+
+# 数据与日志
+data.db
+data.db-wal
+data.db-shm
+logs/
+.state/
+
+# 普查原始数据：每份 1.5MB 的第三方商品快照，可用 tools/census.py 再生。
+# 分析结论保留在 findings/*.md 里，原始 JSON 不入库。
+findings/census/*.json

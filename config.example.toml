@@ -1,0 +1,191 @@
+# 复制为 config.toml 后按注释修改。config.toml 不入 git。
+# 由 tools/make_example_config.py 生成，不要手工编辑。
+# page-watch 配置文件
+#
+# 改完直接生效，launchd 每次运行都重新读取，不用重启任何东西。
+
+db_path = "data.db"
+# timezone = "America/New_York"   # 留空则跟随系统本地时区
+
+
+# ============ 告警渠道 ============
+
+[notify.macos]
+enabled = true
+sound = true          # 播放提示音（afplay，不受通知中心设置影响）
+
+# corner = 系统通知，显示在**主屏右上角**（你的 MacBook 内置屏已是主屏）
+# center = 屏幕正中的模态窗口，可被下一条替换，但位置和屏幕无法指定
+#
+# 注意：corner 样式下，"会不会自动消失"由 macOS 决定，代码控制不了。
+# 要让它停着不走：系统设置 → 通知 → 脚本编辑器 → 提醒样式 → 选「持续提醒」。
+style = "corner"
+
+[notify.email]
+enabled = true
+host = "smtp.gmail.com"
+port = 587            # 587 = STARTTLS，465 = SSL
+username = "你的@gmail.com"
+password = ""         # ← 把 Gmail 应用专用密码粘到这里，只需要改这一行
+from = "你的@gmail.com"
+to = "你的@gmail.com"   # 自己发给自己，Gmail 会正常进收件箱
+use_keychain = false  # 用明文密码。想改用钥匙串就设 true 再跑 setup-email
+
+
+# ======================================================================
+# Watcher 1：榜首监控（这是你真正要的 alert）
+#
+# Women + 按折扣排序。榜首 = 女装清仓里折扣最高、且能直邮的那一件。
+# 匿名抓取不含"仅限门店自提"的商品，所以弹给你的永远是能直接下单的。
+# ======================================================================
+
+[[watcher]]
+name = "nrack_women_top"
+type = "nordstrom_rack"
+enabled = true
+url = "https://www.nordstromrack.com/clearance?breadcrumb=Home%2FClearance&origin=topnav&sort=PercentOff&filterByGenderAge=women&postalCodeAvailability=YOUR_ZIP&preferredStore=YOUR_STORE_ID&preferredPostalCode=YOUR_ZIP"
+# 自动翻页：一直翻到本页最低折扣跌破 until_pct_off 为止。
+# 不能写死页数 —— 折扣分布每天都在变（10-26 第 1 页末尾 88%，10-28 变成 91%），
+# 写死的话规则会悄悄漏掉命中项。max_pages 是安全上限。
+until_pct_off = 90
+max_pages = 6
+pages = 1                  # 仅在没设 until_pct_off 时生效
+track_all_items = true
+timeout = 30
+require_shippable = true   # 榜首跳过明确不能直邮的商品
+
+[watcher.alerts]
+primary_changed = true     # 榜首换人 → 立刻通知（带声音）
+# 只在新榜首确实是新面孔时才报。关掉的话，好货卖掉后榜首换回常驻商品
+# 也会报一次 —— 那是"回到原状"，不是新消息。
+primary_changed_only_new = true
+primary_price_drop = true  # 榜首没换但降价 → 立刻通知
+
+# 前 N 名出现新面孔 → 通知。
+# 实测榜首常被"折扣标得高但没人要"的常驻商品长期霸占（有一件 571 件库存躺一整天
+# 没卖出去却霸榜数周），真好货进来时夺不了冠却很快被买走。只盯第 0 名会一直错过。
+top_n_new = true
+top_n = 15
+# ⚠ 改动 top_n 之后要跑一次 `python3 run.py reseed-top`。
+# 否则新扩出来的那几名不在"见过"记忆里，下一轮会被当成新面孔误报一批。
+# 记忆范围自动取 top_n + 10，所以改这个值不会破坏防重复报告的机制。
+
+new_arrivals = false       # 上新由下面的 Newest watcher 负责，这里不重复打扰
+count_up = false
+
+
+# ---------------- 自定义规则 ----------------
+#
+# 规则在**整个抓取范围**内筛选，不受排名窗口限制 —— 这是它比 top_n 强的地方。
+# 每条规则独立去重：一个条目只要持续满足规则就只报一次，
+# 超过 reentry_hours 没命中过才会重新报。
+#
+# 可用条件（都可省略）：
+#   min_pct_off / max_pct_off     折扣区间
+#   min_ship_qty / max_ship_qty   可直邮件数区间
+#   min_price / max_price         价格区间
+#   require_tags                  必须带的标签，如 ["NEW_MARKDOWN"]
+#
+# 改完规则建议跑一次 `python3 run.py reseed-top` 播种，避免首轮误报一批。
+
+[[watcher.rule]]
+name = "深折扣薄库存"
+enabled = true
+min_pct_off = 90           # 折扣 ≥ 90%
+max_ship_qty = 3           # 最多 3 件 = 手慢就没
+reentry_hours = 24
+
+
+# ======================================================================
+# Watcher 2：上新时点探测器（安静工作，只采数据）
+#
+# 同样是 Women 清仓，但按"最新"排序 —— 第 1 页就是最近上架的 72 件。
+# 真正的新商品会直接落到第 0 位，所以榜首一变就是上新，不需要阈值。
+# ======================================================================
+
+[[watcher]]
+name = "nrack_women_newest"
+type = "nordstrom_rack"
+enabled = true
+url = "https://www.nordstromrack.com/clearance?breadcrumb=Home%2FClearance&origin=topnav&sort=Newest&filterByGenderAge=women&postalCodeAvailability=YOUR_ZIP&preferredStore=YOUR_STORE_ID&preferredPostalCode=YOUR_ZIP"
+pages = 1
+track_all_items = true
+timeout = 30
+require_shippable = false  # 这个 watcher 只测时点，不需要筛可买性
+warmup_polls = 3           # 前 3 次不报上新（此时 item 表还没建立基线）
+
+[watcher.alerts]
+primary_changed = false    # 这一页的榜首只是"最新上架"，不是便宜货
+primary_price_drop = false
+top_n_new = false
+new_arrivals = false       # ← 改成 true 就会在有新商品时通知你
+new_arrivals_min = 1
+count_up = false
+
+# ======================================================================
+# Watcher 3：墨镜（不限性别）
+#
+# 这类商品折扣天生到不了 90%，主 watcher 的抓取范围（≥90% off）永远看不到，
+# 所以单开一个、用站点的品类筛选器把范围缩到 30 件，1 页就能全覆盖。
+# 实测 Gucci 的清仓商品全部是墨镜，所以这一个 watcher 把两条规则都覆盖了。
+# ======================================================================
+
+[[watcher]]
+name = "nrack_sunglasses"
+type = "nordstrom_rack"
+enabled = true
+url = "https://www.nordstromrack.com/clearance?sort=PercentOff&filterByProductType=accessories_sunglasses&postalCodeAvailability=YOUR_ZIP&preferredStore=YOUR_STORE_ID&preferredPostalCode=YOUR_ZIP"
+pages = 1                  # 全品类只有 30 件，1 页够
+track_all_items = true
+timeout = 30
+require_shippable = true
+
+[watcher.alerts]
+primary_changed = false    # 这个 watcher 只看规则，不关心排名
+primary_price_drop = false
+top_n_new = false
+new_arrivals = false
+count_up = false
+
+[[watcher.rule]]
+name = "墨镜 原价250+ 跌破40"
+enabled = true
+min_compare_at = 250       # 原价（对标价）≥ $250
+max_price = 40             # 现价 ≤ $40
+reentry_hours = 24
+
+[[watcher.rule]]
+name = "Gucci墨镜 50以内"
+enabled = true
+brands = ["Gucci"]
+max_price = 50
+reentry_hours = 24
+
+
+# ======================================================================
+# Watcher 4：Save The Duck（不限性别）
+# 清仓里只有 3 件，1 页覆盖。
+# ======================================================================
+
+[[watcher]]
+name = "nrack_save_the_duck"
+type = "nordstrom_rack"
+enabled = true
+url = "https://www.nordstromrack.com/clearance?sort=PercentOff&filterByBrand=save-the-duck&postalCodeAvailability=YOUR_ZIP&preferredStore=YOUR_STORE_ID&preferredPostalCode=YOUR_ZIP"
+pages = 1
+track_all_items = true
+timeout = 30
+require_shippable = true
+
+[watcher.alerts]
+primary_changed = false
+primary_price_drop = false
+top_n_new = false
+new_arrivals = false
+count_up = false
+
+[[watcher.rule]]
+name = "Save The Duck 30以内"
+enabled = true
+max_price = 30
+reentry_hours = 24
