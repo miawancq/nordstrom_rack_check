@@ -110,12 +110,7 @@ def send_macos_persistent(
 
     try:
         if sound:
-            # 声音单独放，不依赖通知中心的设置
-            subprocess.Popen(
-                ["afplay", "/System/Library/Sounds/Glass.aiff"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            play_sound()
         # start_new_session 是必须的，不是可选优化：
         # launchd 任务结束时会回收整个进程组，普通子进程会被连带杀掉，
         # 窗口一闪就没。实测验证过——不加这个参数，launchd 发的窗口
@@ -143,6 +138,73 @@ def send_macos_persistent(
     return None
 
 
+SOUNDS_DIR = Path("/System/Library/Sounds")
+
+
+def system_volume() -> int | None:
+    """读取当前系统输出音量（0-100）。读不到返回 None。"""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", "output volume of (get volume settings)"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+#: afplay -v 的安全区间。太小听不见，太大会削波失真。
+_V_MIN, _V_MAX = 0.5, 12.0
+
+
+def amplification(target: int, current: int | None, fallback: float) -> float:
+    """
+    算出要把 afplay 放大多少倍，才能让提示音听起来相当于"系统音量 target"。
+
+    固定倍数不行：用户把主音量从 25 调到 80 之后，同样的倍数会炸耳朵；
+    调回去又听不见。按当前主音量反推倍数，不管滑块在哪都是一致的响度。
+    """
+    if not current:
+        return fallback
+    return max(_V_MIN, min(_V_MAX, target / current))
+
+
+def play_sound(
+    name: str = "Submarine",
+    volume: float = 2.0,
+    target_volume: int | None = None,
+) -> str | None:
+    """
+    用 afplay 独立播放提示音，不走通知自带的声音。
+
+    通知自带的 `sound name "..."` 走系统提示音通道，会被专注模式、全屏应用
+    抑制，音量也只是主音量的一个比例 —— 放音乐或看视频时基本听不见。
+    afplay 是普通音频播放，走默认输出设备和主音量，不受这些影响。
+
+    target_volume 给定时按当前主音量自适应放大（推荐）；否则用固定的 volume。
+
+    start_new_session 同样是必须的：launchd 任务退出会回收进程组，
+    不加的话声音会被掐断（和持久窗口是同一个坑）。
+    """
+    path = SOUNDS_DIR / f"{name}.aiff"
+    if not path.exists():
+        return f"提示音文件不存在: {path}"
+    v = (amplification(target_volume, system_volume(), volume)
+         if target_volume else volume)
+    try:
+        subprocess.Popen(
+            ["afplay", "-v", f"{v:.2f}", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return f"afplay 调用失败: {exc}"
+    return None
+
+
 def send_macos(alert: Alert, sound: bool = True) -> str | None:
     """
     弹一条 macOS 系统通知（屏幕右上角，显示在主屏上）。
@@ -158,8 +220,8 @@ def send_macos(alert: Alert, sound: bool = True) -> str | None:
         f'display notification "{_osascript_escape(body)}" '
         f'with title "{_osascript_escape(alert.title)}"'
     )
-    if sound and alert.urgent:
-        script += ' sound name "Glass"'
+    # 刻意不加 `sound name "..."` —— 那条通道会被专注模式和全屏应用静音。
+    # 声音统一由 play_sound() 用 afplay 独立播放。
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
@@ -344,6 +406,16 @@ def dispatch(
     macos_cfg = notify_cfg.get("macos", {})
     if macos_cfg.get("enabled", True):
         sound = macos_cfg.get("sound", True)
+        # 声音只放一次：同一轮多条告警合并成一条通知，声音也该只响一次
+        if sound and any(a.urgent for a in alerts):
+            err = play_sound(
+                str(macos_cfg.get("sound_name", "Submarine")),
+                float(macos_cfg.get("sound_volume", 2.0)),
+                macos_cfg.get("sound_target_volume"),
+            )
+            if err:
+                problems.append(err)
+        sound = False  # 下面各分支不再重复放
         # style="center" 用屏幕中央的模态窗口（可替换，但位置无法控制）；
         # style="corner" 用系统通知，显示在主屏右上角 —— 位置和"是否常驻"
         # 都由 macOS 决定，代码管不了，要靠系统设置里的「提醒样式」。

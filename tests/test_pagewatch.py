@@ -1065,6 +1065,106 @@ class TestAsOfHeatmap(unittest.TestCase):
         self.assertEqual(sum(hm["grid"].values()), 0)
 
 
+class TestAlertSound(unittest.TestCase):
+    """
+    提示音走 afplay，不走通知自带的 sound name。
+
+    起因：用户反馈听歌/看视频时听不到提示音。通知自带的声音走系统「提示音」
+    通道，会被专注模式和全屏应用抑制，音量也只是主音量的一个比例。
+    """
+
+    def test_notification_script_has_no_builtin_sound(self):
+        """通知脚本里不能再出现 sound name，否则两条声音路径会打架"""
+        sent = {}
+        class R:
+            returncode = 0
+            stderr = ""
+        with patch("pagewatch.notify.subprocess.run",
+                   side_effect=lambda a, **k: (sent.update(s=a[2]), R())[1]):
+            notify.send_macos(Alert("K", "t", "b", urgent=True), sound=True)
+        self.assertNotIn("sound name", sent["s"])
+
+    def test_play_sound_uses_afplay_with_volume(self):
+        seen = {}
+        class P:
+            pid = 1
+        with patch("pagewatch.notify.subprocess.Popen",
+                   side_effect=lambda a, **k: (seen.update(a=a, k=k), P())[1]):
+            self.assertIsNone(notify.play_sound("Submarine", 2.0))
+        self.assertEqual(seen["a"][0], "afplay")
+        self.assertIn("-v", seen["a"])
+        self.assertEqual(seen["a"][seen["a"].index("-v") + 1], "2.00")
+        self.assertTrue(seen["k"].get("start_new_session"),
+                        "不脱离进程组的话 launchd 退出时声音会被掐断")
+
+    def test_amplification_adapts_to_system_volume(self):
+        """
+        固定倍数不行：主音量 25 时 2 倍还是很小声，调到 80 时 2 倍就炸耳朵。
+        按当前主音量反推，响度才稳定。
+        """
+        from pagewatch.notify import amplification
+        self.assertAlmostEqual(amplification(200, 25, 2.0), 8.0)
+        self.assertAlmostEqual(amplification(200, 100, 2.0), 2.0)
+        self.assertAlmostEqual(amplification(80, 80, 2.0), 1.0)
+
+    def test_amplification_clamped(self):
+        """超过 12 倍会削波失真，低于 0.5 等于听不见"""
+        from pagewatch.notify import amplification
+        self.assertEqual(amplification(1000, 1, 2.0), 12.0)
+        self.assertEqual(amplification(1, 1000, 2.0), 0.5)
+
+    def test_amplification_falls_back_when_volume_unreadable(self):
+        from pagewatch.notify import amplification
+        self.assertEqual(amplification(200, None, 3.3), 3.3)
+        self.assertEqual(amplification(200, 0, 3.3), 3.3)
+
+    def test_target_volume_passed_through_dispatch(self):
+        calls = []
+        with patch("pagewatch.notify.play_sound",
+                   side_effect=lambda *a, **k: calls.append(a) or None), \
+             patch("pagewatch.notify.send_macos", return_value=None):
+            notify.dispatch([Alert("A", "t", "b", urgent=True)],
+                            {"macos": {"enabled": True, "sound": True,
+                                       "sound_target_volume": 200}}, None)
+        self.assertEqual(calls[0][2], 200)
+
+    def test_missing_sound_file_reported(self):
+        self.assertIn("不存在", notify.play_sound("NoSuchSoundXYZ") or "")
+
+    def test_sound_plays_once_per_round(self):
+        """同一轮多条告警合并成一条通知，声音也只该响一次"""
+        calls = []
+        with patch("pagewatch.notify.play_sound",
+                   side_effect=lambda *a, **k: calls.append(a) or None), \
+             patch("pagewatch.notify.send_macos", return_value=None):
+            notify.dispatch(
+                [Alert("A", "t1", "b", urgent=True),
+                 Alert("B", "t2", "b", urgent=True),
+                 Alert("C", "t3", "b", urgent=True)],
+                {"macos": {"enabled": True, "sound": True}}, None)
+        self.assertEqual(len(calls), 1)
+
+    def test_no_sound_for_non_urgent(self):
+        calls = []
+        with patch("pagewatch.notify.play_sound",
+                   side_effect=lambda *a, **k: calls.append(a) or None), \
+             patch("pagewatch.notify.send_macos", return_value=None):
+            notify.dispatch([Alert("A", "t", "b", urgent=False)],
+                            {"macos": {"enabled": True, "sound": True}}, None)
+        self.assertEqual(calls, [])
+
+    def test_sound_config_respected(self):
+        calls = []
+        with patch("pagewatch.notify.play_sound",
+                   side_effect=lambda *a, **k: calls.append(a) or None), \
+             patch("pagewatch.notify.send_macos", return_value=None):
+            notify.dispatch([Alert("A", "t", "b", urgent=True)],
+                            {"macos": {"enabled": True, "sound": True,
+                                       "sound_name": "Hero",
+                                       "sound_volume": 3.5}}, None)
+        self.assertEqual(calls[0], ("Hero", 3.5, None))
+
+
 class TestPersistentAlert(unittest.TestCase):
     """常驻窗口：不自动消失，且新的替换旧的"""
 
@@ -1300,6 +1400,45 @@ class TestExampleConfigHasNoSecrets(unittest.TestCase):
             v = str(email.get(k) or "")
             if v:
                 self.assertNotIn(v, example, f"示例配置泄漏了 {k}")
+
+
+class TestPollAllSelection(unittest.TestCase):
+    """
+    回归：--watcher 改成可重复之后，poll_all 还按单个字符串处理，
+    每次启动直接崩溃，而日志为空看不出原因。
+    """
+
+    def setUp(self):
+        from pagewatch.config import Config
+        self.cfg = Config(watchers={
+            "a": {"name": "a", "type": "x"},
+            "b": {"name": "b", "type": "x"},
+            "c": {"name": "c", "type": "x", "enabled": False},
+        })
+
+    def _names(self, only):
+        from pagewatch import runner
+        seen = []
+        with patch.object(runner, "poll_one",
+                          side_effect=lambda n, *a, **k: seen.append(n)):
+            runner.poll_all(self.cfg, None, only=only)
+        return seen
+
+    def test_list_of_watchers(self):
+        self.assertEqual(self._names(["a", "b"]), ["a", "b"])
+
+    def test_single_string_still_works(self):
+        self.assertEqual(self._names("a"), ["a"])
+
+    def test_none_runs_all_enabled(self):
+        self.assertEqual(self._names(None), ["a", "b"])
+
+    def test_unknown_name_raises_with_all_missing_listed(self):
+        from pagewatch import runner
+        with self.assertRaises(KeyError) as e:
+            runner.poll_all(self.cfg, None, only=["a", "nope", "alsonope"])
+        self.assertIn("nope", str(e.exception))
+        self.assertIn("alsonope", str(e.exception))
 
 
 class TestToLocal(unittest.TestCase):

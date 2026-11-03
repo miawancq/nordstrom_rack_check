@@ -413,6 +413,12 @@ def cmd_test_notify(args: argparse.Namespace) -> int:
 #: 因为它对齐的是站点真实的发布节拍，而不是随便挑个周期。
 GRID_MINUTES = [3, 12, 21, 30, 39, 48, 57]
 
+#: 加密网格：站点的 */9 批次后 +1 和 +5 分钟各抓一次，每小时 14 次（约 4.3 分钟）。
+#: 实测站点的更新**均匀摊在整个 9 分钟窗口里**（只有 14% 落在头 30 秒），
+#: 所以降低延迟只能靠提高频率，调整偏移相位没有用。
+DENSE_MINUTES = sorted({(m + 1) % 60 for m in (0, 9, 18, 27, 36, 45, 54)}
+                       | {(m + 5) % 60 for m in (0, 9, 18, 27, 36, 45, 54)})
+
 PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -425,16 +431,16 @@ PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
         <string>{python}</string>
         <string>{script}</string>
         <string>poll</string>
-    </array>
+{extra_args}    </array>
     <key>WorkingDirectory</key>
     <string>{workdir}</string>
     {schedule}
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{workdir}/logs/poll.log</string>
+    <string>{workdir}/logs/{logname}.log</string>
     <key>StandardErrorPath</key>
-    <string>{workdir}/logs/poll.err.log</string>
+    <string>{workdir}/logs/{logname}.err.log</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
@@ -451,39 +457,57 @@ def cmd_install_launchd(args: argparse.Namespace) -> int:
 
     --grid 对齐站点的 `*/9` cron，在每批发布后 3 分钟抓取，延迟最低。
     """
-    if args.grid:
+    minutes = None
+    if args.minutes:
+        minutes = [int(x) for x in args.minutes.split(",")]
+    elif args.dense:
+        minutes = DENSE_MINUTES
+    elif args.grid:
+        minutes = GRID_MINUTES
+
+    if minutes:
         sched = ("<key>StartCalendarInterval</key>\n    <array>\n"
                  + "".join(f"        <dict><key>Minute</key>"
                            f"<integer>{m}</integer></dict>\n"
-                           for m in GRID_MINUTES)
+                           for m in minutes)
                  + "    </array>")
-        desc = f"对齐站点 */9 节拍，每小时 {len(GRID_MINUTES)} 次（分钟 {GRID_MINUTES}）"
+        desc = f"每小时 {len(minutes)} 次（分钟 {minutes}）"
     else:
         sched = (f"<key>StartInterval</key>\n    "
                  f"<integer>{args.interval * 60}</integer>")
         desc = f"每 {args.interval} 分钟一次"
+    label = LAUNCHD_LABEL + (f".{args.suffix}" if args.suffix else "")
+    plist_path = PLIST_PATH.parent / f"{label}.plist"
+    extra = "".join(f"        <string>--watcher</string>\n"
+                    f"        <string>{w}</string>\n"
+                    for w in (args.watcher or []))
+    logname = args.suffix or "poll"
     (PROJECT_ROOT / "logs").mkdir(exist_ok=True)
     plist = PLIST_TEMPLATE.format(
-        label=LAUNCHD_LABEL,
+        label=label,
         python=sys.executable,
         script=str(PROJECT_ROOT / "run.py"),
         workdir=str(PROJECT_ROOT),
         schedule=sched,
+        extra_args=extra,
+        logname=logname,
     )
-    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.write_text(plist)
-    print(f"已写入 {PLIST_PATH}")
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(plist)
+    print(f"已写入 {plist_path}")
+    if args.watcher:
+        desc += f"  仅 {', '.join(args.watcher)}"
 
     uid = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"],
+    subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"],
                    capture_output=True, check=False)
-    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(PLIST_PATH)],
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)],
                        capture_output=True, text=True, check=False)
     if r.returncode != 0:
         print(f"launchctl bootstrap 失败: {r.stderr.strip()}", file=sys.stderr)
         return 1
-    print(f"已加载，{desc}。日志: {PROJECT_ROOT}/logs/poll.log")
-    print(f"停止:  launchctl bootout gui/{uid}/{LAUNCHD_LABEL}")
+    print(f"已加载，{desc}。日志: {PROJECT_ROOT}/logs/{logname}.log")
+    print(f"停止:  launchctl bootout gui/{uid}/{label}")
     return 0
 
 
@@ -493,7 +517,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("poll", help="抓取一次")
-    p.add_argument("--watcher", help="只跑指定的 watcher")
+    p.add_argument("--watcher", action="append",
+                   help="只跑指定的 watcher，可重复指定多个")
     p.add_argument("--dry-run", action="store_true", help="不写库不发通知")
     p.set_defaults(func=cmd_poll)
 
@@ -540,7 +565,12 @@ def main() -> int:
     p = sub.add_parser("install-launchd", help="安装定时任务")
     p.add_argument("--interval", type=int, default=15, help="固定间隔分钟数，默认 15")
     p.add_argument("--grid", action="store_true",
-                   help="对齐站点 */9 cron（分钟 3,12,21,30,39,48,57），延迟最低")
+                   help="对齐站点 */9 cron（分钟 3,12,21,30,39,48,57）")
+    p.add_argument("--dense", action="store_true",
+                   help="加密网格，每小时 14 次（约 4.3 分钟），延迟减半")
+    p.add_argument("--minutes", help="自定义分钟列表，如 7 或 0,30")
+    p.add_argument("--watcher", action="append", help="该任务只跑这些 watcher")
+    p.add_argument("--suffix", help="任务名后缀，用于并存多个调度")
     p.set_defaults(func=cmd_install_launchd)
 
     args = ap.parse_args()

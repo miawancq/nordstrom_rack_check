@@ -542,12 +542,20 @@ def poll_one(name: str, cfg: Config, store: Store, dry_run: bool = False) -> Pol
     )
 
 
-def poll_all(cfg: Config, store: Store, only: str | None = None,
+def poll_all(cfg: Config, store: Store,
+             only: str | list[str] | None = None,
              dry_run: bool = False) -> list[PollResult]:
-    """执行所有启用的 watcher；only 指定时只跑那一个"""
+    """
+    执行所有启用的 watcher。
+
+    only 可以是单个名字，也可以是名字列表 —— 调度拆成"告警组"和"采数据组"
+    两个 launchd 任务后，需要一次指定多个。
+    """
     targets = cfg.enabled_watchers()
     if only:
-        if only not in cfg.watchers:
-            raise KeyError(f"配置中没有名为 '{only}' 的 watcher")
-        targets = {only: cfg.watchers[only]}
+        names = [only] if isinstance(only, str) else list(only)
+        missing = [n for n in names if n not in cfg.watchers]
+        if missing:
+            raise KeyError(f"配置中没有名为 {', '.join(missing)} 的 watcher")
+        targets = {n: cfg.watchers[n] for n in names}
     return [poll_one(name, cfg, store, dry_run=dry_run) for name in targets]
