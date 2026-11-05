@@ -856,6 +856,32 @@ class TestDetectAnomaly(unittest.TestCase):
     def test_doubling_is_rejected(self):
         self.assertIsNotNone(_detect_anomaly(20000, self.BASE, 0.5))
 
+    def test_small_result_set_not_falsely_flagged(self):
+        """
+        回归：Save The Duck 只有 1-3 件，1→2 是 +100%，只看相对偏离会被
+        判成异常丢掉 —— 而那正是"上了一件新货"，是要告警的事件。
+        实测 456 次抓取里误杀了 13 次。
+        """
+        base = [1, 1, 1, 1, 1]
+        self.assertIsNone(_detect_anomaly(2, base, 0.5))
+        self.assertIsNone(_detect_anomaly(3, base, 0.5))
+        self.assertIsNone(_detect_anomaly(0, base, 0.5))
+
+    def test_large_degraded_set_still_caught(self):
+        """加了绝对门槛之后，真正的残缺结果集必须照样挡住"""
+        self.assertIsNotNone(_detect_anomaly(400, [6950]*5, 0.5))
+        self.assertIsNotNone(_detect_anomaly(152, [25]*5, 0.5))
+
+    def test_abs_floor_is_configurable(self):
+        base = [100]*5
+        self.assertIsNone(_detect_anomaly(40, base, 0.5, min_abs=100))
+        self.assertIsNotNone(_detect_anomaly(40, base, 0.5, min_abs=10))
+
+    def test_both_conditions_required(self):
+        """相对够、绝对不够 → 放行；绝对够、相对不够 → 也放行"""
+        self.assertIsNone(_detect_anomaly(5, [3]*5, 0.5))        # 相对 67% 但只差 2
+        self.assertIsNone(_detect_anomaly(6900, [7000]*5, 0.5))  # 差 100 但只偏 1.4%
+
     def test_insufficient_history_accepts_everything(self):
         """样本不足时不做判断，否则冷启动会把一切都当异常"""
         self.assertIsNone(_detect_anomaly(400, [6950, 6948], 0.5))
@@ -1439,6 +1465,65 @@ class TestPollAllSelection(unittest.TestCase):
             runner.poll_all(self.cfg, None, only=["a", "nope", "alsonope"])
         self.assertIn("nope", str(e.exception))
         self.assertIn("alsonope", str(e.exception))
+
+
+class TestStartStop(unittest.TestCase):
+    """开关定时抓取。用户会经常开关，所以要幂等、要能发现未安装的情况。"""
+
+    @staticmethod
+    def _mod():
+        import importlib.util
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location("runcli", root / "run.py")
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_start_skips_already_running(self):
+        """重复 start 不能重复 bootstrap，否则 launchctl 报错"""
+        m = self._mod()
+        calls = []
+        with patch.object(m, "_installed_jobs",
+                          return_value=[("a", Path("/tmp/a.plist"))]), \
+             patch.object(m, "_job_running", return_value=True), \
+             patch.object(m.subprocess, "run",
+                          side_effect=lambda a, **k: calls.append(a) or
+                          type("R", (), {"stdout": "501", "stderr": "",
+                                         "returncode": 0})()):
+            m.cmd_start(None)
+        self.assertFalse(any("bootstrap" in c for c in calls))
+
+    def test_stop_skips_not_running(self):
+        m = self._mod()
+        calls = []
+        with patch.object(m, "_installed_jobs",
+                          return_value=[("a", Path("/tmp/a.plist"))]), \
+             patch.object(m, "_job_running", return_value=False), \
+             patch.object(m.subprocess, "run",
+                          side_effect=lambda a, **k: calls.append(a) or
+                          type("R", (), {"stdout": "501", "stderr": "",
+                                         "returncode": 0})()):
+            m.cmd_stop(None)
+        self.assertFalse(any("bootout" in c for c in calls))
+
+    def test_start_without_install_errors(self):
+        m = self._mod()
+        with patch.object(m, "_installed_jobs", return_value=[]), \
+             patch.object(m.subprocess, "run",
+                          return_value=type("R", (), {"stdout": "501",
+                                                      "stderr": "",
+                                                      "returncode": 0})()):
+            self.assertEqual(m.cmd_start(None), 1)
+
+    def test_stop_without_install_is_not_an_error(self):
+        """没装过任务时 stop 不该报错 —— 它本来就是停着的"""
+        m = self._mod()
+        with patch.object(m, "_installed_jobs", return_value=[]), \
+             patch.object(m.subprocess, "run",
+                          return_value=type("R", (), {"stdout": "501",
+                                                      "stderr": "",
+                                                      "returncode": 0})()):
+            self.assertEqual(m.cmd_stop(None), 0)
 
 
 class TestToLocal(unittest.TestCase):

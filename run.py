@@ -91,6 +91,15 @@ def cmd_poll(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    uid = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
+    jobs = _installed_jobs()
+    if jobs:
+        on = [lbl for lbl, _ in jobs if _job_running(lbl, uid)]
+        print(f"=== 定时抓取: {'开启' if on else '已关闭'} "
+              f"({len(on)}/{len(jobs)} 个任务在跑) ===")
+        for lbl, _ in jobs:
+            print(f"  {'●' if lbl in on else '○'} {lbl}")
+        print()
     cfg = load(args.config)
     store = Store(cfg.db_path)
     try:
@@ -297,6 +306,62 @@ def cmd_setup_email(args: argparse.Namespace) -> int:
 
     print("\n发送测试邮件...")
     return cmd_test_notify(args)
+
+
+def _installed_jobs() -> list[tuple[str, Path]]:
+    """找出已安装的 pagewatch launchd 任务，返回 [(label, plist 路径)]"""
+    out = []
+    for f in sorted(PLIST_PATH.parent.glob(f"{LAUNCHD_LABEL}*.plist")):
+        out.append((f.stem, f))
+    return out
+
+
+def _job_running(label: str, uid: str) -> bool:
+    r = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"],
+                       capture_output=True, check=False)
+    return r.returncode == 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """打开定时抓取。已经在跑的任务会跳过，不会重复加载。"""
+    uid = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
+    jobs = _installed_jobs()
+    if not jobs:
+        print("没有已安装的任务。先跑 install-launchd。", file=sys.stderr)
+        return 1
+    for label, path in jobs:
+        if _job_running(label, uid):
+            print(f"  {label}  已在运行，跳过")
+            continue
+        r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(path)],
+                           capture_output=True, text=True, check=False)
+        if r.returncode:
+            print(f"  {label}  启动失败: {r.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  {label}  ✓ 已启动")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    """
+    关闭定时抓取。
+
+    只是 bootout，plist 文件保留 —— 下次 start 可以直接拉起来，
+    不用重新 install。
+    """
+    uid = subprocess.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
+    jobs = _installed_jobs()
+    if not jobs:
+        print("没有已安装的任务。")
+        return 0
+    for label, _ in jobs:
+        if not _job_running(label, uid):
+            print(f"  {label}  本来就没在跑")
+            continue
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"],
+                       capture_output=True, check=False)
+        print(f"  {label}  ✓ 已停止")
+    return 0
 
 
 def cmd_blocks(args: argparse.Namespace) -> int:
@@ -547,6 +612,12 @@ def main() -> int:
     p.add_argument("--watcher")
     p.add_argument("--limit", type=int, default=30)
     p.set_defaults(func=cmd_events)
+
+    p = sub.add_parser("start", help="打开定时抓取")
+    p.set_defaults(func=cmd_start)
+
+    p = sub.add_parser("stop", help="关闭定时抓取（plist 保留，随时可 start）")
+    p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("blocks", help="被挡/被降级情况汇总，判断是否触发限流")
     p.set_defaults(func=cmd_blocks)

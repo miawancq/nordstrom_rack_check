@@ -64,7 +64,7 @@ def _to_local(ts: datetime, tz_name: str | None) -> datetime:
 
 
 def _detect_anomaly(
-    total: int | None, recent: list[int], max_dev: float
+    total: int | None, recent: list[int], max_dev: float, min_abs: int = 10
 ) -> str | None:
     """
     判断本次结果集是否不可信，不可信时返回原因字符串。
@@ -73,9 +73,14 @@ def _detect_anomaly(
     商品也完全换掉，下一次抓取又恢复正常。原因不明（疑似后端降级或限流）。
     如果不拦住，它会制造假的"榜首换人"告警，并往 item 表灌几十件假新品。
 
-    判据：和最近若干次可信抓取的中位数相比偏离超过 max_dev（默认 50%）。
-    日常波动是分钟级 ±10（约 0.15%），正常补货也远不到 50%，所以这个
-    阈值既挡得住残缺结果，又不会误伤真实的大批量上架。
+    判据：和最近若干次可信抓取的中位数相比，**相对**偏离超过 max_dev（默认 50%）
+    **且绝对**偏离不少于 min_abs 件。
+
+    绝对门槛是必须的：只看相对偏离的话，小结果集会被误杀。实测 Save The Duck
+    这个 watcher 只有 1-3 件，从 1 件变 2 件就是 +100% —— 而那恰恰是"上了一件
+    新货"，正是要告警的事件，却被当成异常丢掉（不告警、不入库、不作基线）。
+    历史数据里两组分得很开：误判的绝对差是 1-2，真异常是 126-6088，
+    门槛取 10 落在空隙中间，任何 5~50 之间的取值结果都一样。
     """
     if total is None:
         return "结果中没有总数字段"
@@ -84,9 +89,11 @@ def _detect_anomaly(
     median = statistics.median(recent)
     if median <= 0:
         return None
-    deviation = abs(total - median) / median
-    if deviation > max_dev:
-        return f"总数 {total:,} 偏离近期中位数 {median:,.0f} 达 {deviation:.0%}"
+    gap = abs(total - median)
+    deviation = gap / median
+    if deviation > max_dev and gap >= min_abs:
+        return (f"总数 {total:,} 偏离近期中位数 {median:,.0f} "
+                f"达 {deviation:.0%}（差 {gap:,.0f} 件）")
     return None
 
 
@@ -425,6 +432,7 @@ def poll_one(name: str, cfg: Config, store: Store, dry_run: bool = False) -> Pol
         obs.total_count,
         store.recent_counts(name),
         float(wcfg.get("anomaly_max_deviation", 0.5)),
+        int(wcfg.get("anomaly_min_abs", 10)),
     )
     anomalous = anomaly_reason is not None
 
