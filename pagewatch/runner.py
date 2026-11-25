@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import json
-import statistics
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -64,36 +63,54 @@ def _to_local(ts: datetime, tz_name: str | None) -> datetime:
 
 
 def _detect_anomaly(
-    total: int | None, recent: list[int], max_dev: float, min_abs: int = 10
+    cur_ids: list[str],
+    prev_ids: list[str] | None,
+    min_overlap: float = 0.5,
+    min_items: int = 20,
 ) -> str | None:
     """
     判断本次结果集是否不可信，不可信时返回原因字符串。
 
-    实测 Nordstrom Rack 偶尔会返回一个残缺结果集：总数从 6950 骤降到 400，
-    商品也完全换掉，下一次抓取又恢复正常。原因不明（疑似后端降级或限流）。
+    实测 Nordstrom Rack 偶尔会返回一个残缺结果集：整页商品完全换掉，
+    下一次抓取又恢复正常。原因不明（疑似后端降级或限流）。
     如果不拦住，它会制造假的"榜首换人"告警，并往 item 表灌几十件假新品。
 
-    判据：和最近若干次可信抓取的中位数相比，**相对**偏离超过 max_dev（默认 50%）
-    **且绝对**偏离不少于 min_abs 件。
+    判据是**和上一轮的条目重叠率**，不看总数。重叠率低于 min_overlap 就不可信。
 
-    绝对门槛是必须的：只看相对偏离的话，小结果集会被误杀。实测 Save The Duck
-    这个 watcher 只有 1-3 件，从 1 件变 2 件就是 +100% —— 而那恰恰是"上了一件
-    新货"，正是要告警的事件，却被当成异常丢掉（不告警、不入库、不作基线）。
-    历史数据里两组分得很开：误判的绝对差是 1-2，真异常是 126-6088，
-    门槛取 10 落在空隙中间，任何 5~50 之间的取值结果都一样。
+    为什么不用总数：总数判不出残缺集，只判得出"数量变了"，而这两件事是分开的。
+    2026-11-12 凌晨站点真实补货，women_top 从 3,767 涨到 8,846 并稳住，
+    旧的中位数判据把每一轮都判成异常；而基线又只收可信样本，于是中位数
+    永远停在 3,787，锁死 13 小时、近 200 轮一条告警都发不出来。
+    水位是会跳的，页面内容不会无缘无故整页换掉 —— 后者才是真信号。
+
+    实测这两组分得极开（重叠率按较小的那个集合归一）：
+      正常相邻两轮      98.6% ~ 100%
+      残缺集脉冲        0% ~ 4.3%
+      真实补货跃迁      首轮 40.3%，之后每轮 100%
+    门槛取 50% 落在 40.3% 和 98.6% 的空隙里。真实跃迁的首轮会被误判成异常、
+    少报一轮（约 4 分钟），但第二轮就和首轮对上 100% 而恢复 —— 参照物是
+    **紧邻的上一轮**（见 store.last_snapshot_any），不是最后一个可信快照，
+    所以站点换了水位能自己走出来，不会再卡死。
+
+    min_items 是小结果集的保护：只有几件商品时，卖掉一件就能让重叠率暴跌，
+    而那恰恰是要告警的事件。实测 Save The Duck 常年只有 3-10 件，
+    sunglasses 也曾长期只有 1 件。两边条目数都不足 min_items 时一律放行。
     """
-    if total is None:
-        return "结果中没有总数字段"
-    if len(recent) < 3:
-        return None  # 样本不足，先全部接受，等基线建立起来
-    median = statistics.median(recent)
-    if median <= 0:
+    if prev_ids is None:
+        return None  # 头一次跑，没有参照物
+    prev_set, cur_set = set(prev_ids), set(cur_ids)
+    if not prev_set:
         return None
-    gap = abs(total - median)
-    deviation = gap / median
-    if deviation > max_dev and gap >= min_abs:
-        return (f"总数 {total:,} 偏离近期中位数 {median:,.0f} "
-                f"达 {deviation:.0%}（差 {gap:,.0f} 件）")
+    if not cur_set:
+        # 上一轮还有一整页、这一轮空了，是典型的降级响应
+        return "结果集为空" if len(prev_set) >= min_items else None
+    n = min(len(prev_set), len(cur_set))
+    if n < min_items:
+        return None  # 小结果集，重叠率没有判别力
+    overlap = len(prev_set & cur_set) / n
+    if overlap < min_overlap:
+        return (f"与上一轮的条目重叠率仅 {overlap:.0%}"
+                f"（{len(prev_set & cur_set)}/{n} 件），整页换掉了")
     return None
 
 
@@ -264,27 +281,34 @@ def _build_alerts(
     # 一件好货抢到榜首 → 报一次（对）；它卖掉后榜首换回原来的常驻商品 → 又报一次
     # （错，什么新东西都没有）。实测 10-24 06:17 和 06:32 就是这么一对。
     new_ids = {i.item_id for i in (new_in_top or [])}
-    if alert_cfg.get("primary_changed", True) and p and prev is not None:
+    # 外层只判"有没有比较的基础"，两个开关各自在自己的分支里判。
+    # 曾经外层用的是 primary_changed，于是关掉"榜首换人"会把"榜首降价"
+    # 一起静默掉 —— 两个独立的开关，关一个却停了两个，不会有人想到。
+    if p and prev is not None:
         prev_id = prev["primary_item_id"]
         is_revert = (alert_cfg.get("primary_changed_only_new", True)
                      and p.item_id not in new_ids)
-        if prev_id and prev_id != p.item_id and not is_revert:
+        if (alert_cfg.get("primary_changed", True)
+                and prev_id and prev_id != p.item_id and not is_revert):
+            # "换掉的是谁"是这条告警的关键上下文：没有它就只知道榜首是什么，
+            # 不知道它顶掉了什么、值不值得看。单独放 context 里，
+            # 邮件在商品下面呈现，不和逐件渲染的商品信息重复。
+            was = (f"上一个: {prev['primary_title'] or prev_id} "
+                   f"({_fmt_money(prev['primary_price'])})")
             lines = [p.label(), p.price_line()]
             if p.flags():
                 lines.append(p.flags())
-            lines.append(
-                f"上一个: {prev['primary_title'] or prev_id} "
-                f"({_fmt_money(prev['primary_price'])})"
-            )
-            body = "\n".join(lines)
+            lines.append(was)
             alerts.append(
                 Alert(
                     kind="PRIMARY_CHANGED",
                     title=f"榜首换人 · {p.pct_off}% off" if p.pct_off else "榜首换人",
-                    body=body,
+                    body="\n".join(lines),
                     url=p.url,
                     urgent=True,
                     item_id=p.item_id,
+                    items=(p,),
+                    context=was,
                 )
             )
         # --- 2. 第一个商品没换但降价了 ---
@@ -296,6 +320,9 @@ def _build_alerts(
             and p.price < float(prev["primary_price"])
         ):
             drop = float(prev["primary_price"]) - p.price
+            # 商品行只显示现价和站点标的原价，看不出"相对上一轮降了多少"，
+            # 而那正是这条告警的由来，所以把降价前的价格留在 context 里
+            was = f"上一次看到: {_fmt_money(prev['primary_price'])}"
             alerts.append(
                 Alert(
                     kind="PRIMARY_PRICE_DROP",
@@ -307,6 +334,8 @@ def _build_alerts(
                     url=p.url,
                     urgent=True,
                     item_id=p.item_id,
+                    items=(p,),
+                    context=was,
                 )
             )
 
@@ -334,6 +363,7 @@ def _build_alerts(
                 url=best.url,
                 urgent=True,
                 item_id=new_in_top[0].item_id,
+                items=tuple(new_in_top),
             )
         )
 
@@ -357,6 +387,7 @@ def _build_alerts(
                 url=best.url,
                 urgent=True,
                 item_id=hits[0].item_id,
+                items=tuple(hits),
             )
         )
 
@@ -428,11 +459,18 @@ def poll_one(name: str, cfg: Config, store: Store, dry_run: bool = False) -> Pol
 
     # 结果集可信度检查。不可信就只留痕、不告警、不污染 item 表，
     # 也不会成为下一次的 diff 基线。
+    #
+    # 参照物刻意用"紧邻的上一轮"（含不可信的），不是上面那个可信的 prev：
+    # 判定问的是"这一轮和上一轮长得像不像"。用可信快照当参照，站点换了水位后
+    # 每轮都在和一个再也不会回来的旧快照比，会永久判异常（实测卡死过 13 小时）。
+    last_any = store.last_snapshot_any(name)
+    prev_ids = (json.loads(last_any["item_ids"])
+                if last_any is not None and last_any["item_ids"] else None)
     anomaly_reason = _detect_anomaly(
-        obs.total_count,
-        store.recent_counts(name),
-        float(wcfg.get("anomaly_max_deviation", 0.5)),
-        int(wcfg.get("anomaly_min_abs", 10)),
+        obs.item_ids,
+        prev_ids,
+        float(wcfg.get("anomaly_min_overlap", 0.5)),
+        int(wcfg.get("anomaly_min_items", 20)),
     )
     anomalous = anomaly_reason is not None
 

@@ -115,3 +115,23 @@ class Alert:
     url: str | None = None
     urgent: bool = False
     item_id: str | None = None
+
+    items: tuple[Item, ...] = ()
+    """
+    这条告警涉及的商品，按展示顺序。
+
+    和 body 分开存：body 是给 macOS 通知看的短文本，塞不下几条链接；
+    items 是结构化数据，邮件据此渲染成每件商品一个超链接。
+    一条告警报 7 件新货时，只给一个 url 根本看不出具体是什么东西。
+
+    COUNT_UP / NEW_ARRIVALS 这类只报数量的告警没有商品可带，留空。
+    """
+
+    context: str = ""
+    """
+    商品列表之外的补充说明，如"上一个: Halogen Ribbed Sweater ($4.29)"。
+
+    为什么不直接把 body 渲染进邮件：带商品的告警里 body 本身就包含商品名和
+    价格，和逐件渲染的列表重复。context 只放 body 里**商品信息之外**的那部分，
+    邮件在商品列表下面单独呈现 —— 榜首换人时"换掉的是谁"正是关键上下文。
+    """

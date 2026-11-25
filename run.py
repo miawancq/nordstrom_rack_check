@@ -456,19 +456,37 @@ def cmd_blocks(args: argparse.Namespace) -> int:
 
 def cmd_test_notify(args: argparse.Namespace) -> int:
     cfg = load(args.config)
+    # 挂几件样例商品：测试通知要同时验证"渠道通不通"和"每件商品的链接对不对"，
+    # 只发一条光秃秃的文本就走不到邮件里的逐件渲染，等于没测到。
+    #
+    # 样例一定要从库里取真货，不能手写。实测踩过：手写样例里的 pid 是从日志
+    # 随手抄的，它属于另一件商品，点进去是条连衣裙而标题写着耳钉，看上去
+    # 活像"链接和标题对不上"的程序 bug，白查了一轮。库是空的就不发商品，
+    # 也绝不编一个。
+    store = Store(cfg.db_path)
+    try:
+        samples = tuple(store.recent_items(3))
+    finally:
+        store.close()
+    if not samples:
+        print("提示: 库里还没有商品，这封测试通知不含商品链接", file=sys.stderr)
     alert = Alert(
         kind="TEST",
         title="page-watch 测试通知",
         body="如果你看到这条，说明通知渠道是通的。",
-        url="https://www.nordstromrack.com/clearance",
+        url=samples[0].url if samples else "https://www.nordstromrack.com/clearance",
         urgent=True,
+        items=samples,
     )
     problems = notify.dispatch([alert], cfg.notify, cfg.db_path.parent / '.state')
     if problems:
         for p in problems:
             print(f"✗ {p}", file=sys.stderr)
         return 1
-    enabled = [k for k in ("macos", "email") if cfg.notify.get(k, {}).get("enabled")]
+    # 渠道名单从配置里现取，不要写死 —— 写死的话新加渠道会"发了但不报"，
+    # 看上去像没发，白排查一轮
+    enabled = [k for k, v in cfg.notify.items()
+               if isinstance(v, dict) and v.get("enabled")]
     print(f"✓ 已发送到: {', '.join(enabled) or '(没有启用任何渠道)'}")
     return 0
 

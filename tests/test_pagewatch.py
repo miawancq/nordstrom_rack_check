@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import urllib.error
 import unittest
 from unittest.mock import patch
 from datetime import UTC, datetime, timedelta
@@ -838,56 +839,78 @@ class TestAnalyze(unittest.TestCase):
 
 
 class TestDetectAnomaly(unittest.TestCase):
-    """站点实测会偶发返回残缺结果集（6950 件 → 400 件），必须挡住"""
+    """
+    站点实测会偶发返回残缺结果集（整页商品完全换掉），必须挡住。
 
-    BASE = [6950, 6948, 6952, 6949, 6951]
+    判据是和上一轮的条目重叠率，不看总数 —— 总数判不出残缺集，只判得出
+    "数量变了"。实测 2026-11-12 站点真实补货把旧的总数判据锁死了 13 小时。
+    """
+
+    # 一整页 72 件，模拟真实抓取规模
+    PAGE = [f"p{i}" for i in range(72)]
 
     def test_real_world_degraded_response(self):
-        self.assertIsNotNone(_detect_anomaly(400, self.BASE, 0.5))
+        """残缺集整页换掉，实测重叠率只有 4.3%"""
+        degraded = [f"d{i}" for i in range(46)] + ["p0", "p1", "p2"]
+        self.assertIsNotNone(_detect_anomaly(degraded, self.PAGE))
 
     def test_normal_jitter_passes(self):
-        for total in (6940, 6960, 6900, 7000):
-            self.assertIsNone(_detect_anomaly(total, self.BASE, 0.5), f"total={total}")
+        """正常相邻两轮换掉一两件，实测重叠率 98.6%~100%"""
+        self.assertIsNone(_detect_anomaly(self.PAGE, self.PAGE))
+        one_sold = ["new0"] + self.PAGE[1:]
+        self.assertIsNone(_detect_anomaly(one_sold, self.PAGE))
+        few_sold = ["n0", "n1", "n2"] + self.PAGE[3:]
+        self.assertIsNone(_detect_anomaly(few_sold, self.PAGE))
 
-    def test_large_but_plausible_restock_passes(self):
-        """真实大批量上架 +30% 不能被误杀"""
-        self.assertIsNone(_detect_anomaly(9035, self.BASE, 0.5))
+    def test_count_change_alone_never_flags(self):
+        """
+        回归 2026-11-12：站点一夜之间从 3,767 件补到 8,846 件并稳住，
+        旧的总数判据把之后每一轮都判成异常，锁死 13 小时无告警。
+        只要页面内容没换，件数怎么跳都不该影响可信度 —— 这里连件数都不传了。
+        """
+        self.assertIsNone(_detect_anomaly(self.PAGE, self.PAGE))
 
-    def test_doubling_is_rejected(self):
-        self.assertIsNotNone(_detect_anomaly(20000, self.BASE, 0.5))
+    def test_level_shift_recovers_on_next_poll(self):
+        """
+        真实跃迁的首轮会被判异常（实测重叠 40.3%），但参照物是紧邻的上一轮，
+        所以第二轮和首轮对上 100%，立刻恢复 —— 不会再卡死。
+        """
+        shifted = self.PAGE[:29] + [f"s{i}" for i in range(43)]
+        self.assertIsNotNone(_detect_anomaly(shifted, self.PAGE))   # 首轮
+        self.assertIsNone(_detect_anomaly(shifted, shifted))        # 第二轮即恢复
 
     def test_small_result_set_not_falsely_flagged(self):
         """
-        回归：Save The Duck 只有 1-3 件，1→2 是 +100%，只看相对偏离会被
-        判成异常丢掉 —— 而那正是"上了一件新货"，是要告警的事件。
-        实测 456 次抓取里误杀了 13 次。
+        Save The Duck 常年只有 3-10 件，sunglasses 也曾长期只有 1 件。
+        这种规模下卖掉一件就能让重叠率暴跌，而那正是要告警的事件。
         """
-        base = [1, 1, 1, 1, 1]
-        self.assertIsNone(_detect_anomaly(2, base, 0.5))
-        self.assertIsNone(_detect_anomaly(3, base, 0.5))
-        self.assertIsNone(_detect_anomaly(0, base, 0.5))
+        self.assertIsNone(_detect_anomaly(["a", "b"], ["a"]))
+        self.assertIsNone(_detect_anomaly(["x"], ["a"]))
+        self.assertIsNone(_detect_anomaly([f"n{i}" for i in range(10)],
+                                          [f"o{i}" for i in range(10)]))
 
-    def test_large_degraded_set_still_caught(self):
-        """加了绝对门槛之后，真正的残缺结果集必须照样挡住"""
-        self.assertIsNotNone(_detect_anomaly(400, [6950]*5, 0.5))
-        self.assertIsNotNone(_detect_anomaly(152, [25]*5, 0.5))
+    def test_min_items_is_configurable(self):
+        cur, prev = [f"n{i}" for i in range(30)], [f"o{i}" for i in range(30)]
+        self.assertIsNone(_detect_anomaly(cur, prev, min_items=100))
+        self.assertIsNotNone(_detect_anomaly(cur, prev, min_items=20))
 
-    def test_abs_floor_is_configurable(self):
-        base = [100]*5
-        self.assertIsNone(_detect_anomaly(40, base, 0.5, min_abs=100))
-        self.assertIsNotNone(_detect_anomaly(40, base, 0.5, min_abs=10))
+    def test_min_overlap_is_configurable(self):
+        half = self.PAGE[:36] + [f"n{i}" for i in range(36)]
+        self.assertIsNone(_detect_anomaly(half, self.PAGE, min_overlap=0.4))
+        self.assertIsNotNone(_detect_anomaly(half, self.PAGE, min_overlap=0.9))
 
-    def test_both_conditions_required(self):
-        """相对够、绝对不够 → 放行；绝对够、相对不够 → 也放行"""
-        self.assertIsNone(_detect_anomaly(5, [3]*5, 0.5))        # 相对 67% 但只差 2
-        self.assertIsNone(_detect_anomaly(6900, [7000]*5, 0.5))  # 差 100 但只偏 1.4%
+    def test_no_previous_accepts_everything(self):
+        """头一次跑没有参照物，否则冷启动会把一切都当异常"""
+        self.assertIsNone(_detect_anomaly(self.PAGE, None))
+        self.assertIsNone(_detect_anomaly(self.PAGE, []))
 
-    def test_insufficient_history_accepts_everything(self):
-        """样本不足时不做判断，否则冷启动会把一切都当异常"""
-        self.assertIsNone(_detect_anomaly(400, [6950, 6948], 0.5))
+    def test_empty_page_after_full_page_is_anomalous(self):
+        """上一轮一整页、这一轮空了，是典型的降级响应"""
+        self.assertIsNotNone(_detect_anomaly([], self.PAGE))
 
-    def test_missing_total_is_anomalous(self):
-        self.assertIsNotNone(_detect_anomaly(None, self.BASE, 0.5))
+    def test_empty_page_after_small_page_passes(self):
+        """小 watcher 清仓卖光是真事，不是降级"""
+        self.assertIsNone(_detect_anomaly([], ["a", "b"]))
 
 
 class TestAnomalyIsolation(unittest.TestCase):
@@ -910,11 +933,358 @@ class TestAnomalyIsolation(unittest.TestCase):
                           track_items=False, anomalous=True)
 
         last = self.store.last_snapshot("t")
-        self.assertEqual(last["total_count"], 6950, "异常快照不能当基线")
-        self.assertEqual(self.store.recent_counts("t"), [6950])
+        self.assertEqual(last["total_count"], 6950, "异常快照不能当 diff 基线")
+        # 但可信度判定要和紧邻的上一轮比，那里必须看得见异常快照，
+        # 否则站点换了水位之后会永远判异常（2026-11-12 实测卡死 13 小时）
+        self.assertEqual(self.store.last_snapshot_any("t")["total_count"], 400)
         self.assertNotIn("ZZZ", self.store.known_item_ids("t"), "异常数据不能进 item 表")
         self.assertEqual(self.store.snapshot_count("t"), 1)
         self.assertEqual(len(self.store.snapshots("t")), 2, "但异常本身要留痕")
+
+
+class _FakeResp:
+    def __init__(self, payload=b'{"code":200,"message":"success"}'):
+        self._p = payload
+    def read(self, n=None): return self._p
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+class TestBarkPush(unittest.TestCase):
+    """
+    Bark 推送：人不在电脑旁时手机能响。邮件不弹锁屏，这是它存在的理由。
+    """
+
+    CHEAP = Item("1", "Resin Ring", "NORDSTROM RACK", 3.99, 60.0, 93,
+                 "https://r.com/s/ring/1")
+    LUXE = Item("2", "BB Pointed Toe Pump", "Manolo Blahnik", 28.98, 825.0, 96,
+                "https://r.com/s/manolo-bb/2")
+
+    #: cfg 要能显式传空字典（测"没配 key"），所以不能用 `cfg or {...}` 兜底
+    _DEFAULT_CFG = object()
+
+    def _send(self, alerts, cfg=_DEFAULT_CFG, resp=None):
+        """拦住真实网络请求，返回 (错误, 发出去的 payload 列表)"""
+        if cfg is self._DEFAULT_CFG:
+            cfg = {"key": "DEVKEY"}
+        sent = []
+        def fake_urlopen(req, timeout=None):
+            sent.append((req.full_url, json.loads(req.data.decode())))
+            return resp or _FakeResp()
+        with patch("urllib.request.urlopen", fake_urlopen):
+            err = notify.send_bark(alerts, cfg)
+        return err, sent
+
+    def _alert(self, *items, urgent=True):
+        return Alert("RULE_MATCH", "深折扣薄库存", "正文",
+                     items[0].url if items else None, urgent,
+                     items[0].item_id if items else None, tuple(items))
+
+    def test_pushes_one_per_alert(self):
+        err, sent = self._send([self._alert(self.LUXE), self._alert(self.CHEAP)])
+        self.assertIsNone(err)
+        self.assertEqual(len(sent), 2, "一条告警推一条，不合并")
+
+    def test_url_points_at_first_item(self):
+        """Bark 一条通知只能挂一个 URL，必须是本条里的商品"""
+        _, sent = self._send([self._alert(self.LUXE)])
+        self.assertEqual(sent[0][1]["url"], self.LUXE.url)
+
+    def test_body_leads_with_price(self):
+        """锁屏只扫一眼，先看到的该是多少钱"""
+        _, sent = self._send([self._alert(self.LUXE)])
+        self.assertTrue(sent[0][1]["body"].startswith("$28.98"), sent[0][1]["body"])
+        self.assertIn("Manolo Blahnik", sent[0][1]["body"])
+
+    def test_missing_key_is_reported_not_crashed(self):
+        err, sent = self._send([self._alert(self.LUXE)], cfg={})
+        self.assertIn("key", err)
+        self.assertEqual(sent, [])
+
+    def test_urgent_uses_time_sensitive(self):
+        """专注模式下也要能穿透 —— 不然这渠道白做"""
+        _, sent = self._send([self._alert(self.LUXE, urgent=True)])
+        self.assertEqual(sent[0][1]["level"], "timeSensitive")
+        _, sent = self._send([self._alert(self.LUXE, urgent=False)])
+        self.assertEqual(sent[0][1]["level"], "passive")
+
+    def test_no_filter_by_default_pushes_everything(self):
+        """用户选的就是全推，默认不能偷偷过滤"""
+        _, sent = self._send([self._alert(self.CHEAP)])
+        self.assertEqual(len(sent), 1)
+
+    def test_min_compare_at_filters(self):
+        cfg = {"key": "K", "min_compare_at": 800}
+        _, sent = self._send([self._alert(self.CHEAP)], cfg)
+        self.assertEqual(sent, [], "$60 原价的不该打扰锁屏")
+        _, sent = self._send([self._alert(self.LUXE)], cfg)
+        self.assertEqual(len(sent), 1, "$825 原价的要推")
+
+    def test_filter_narrows_body_to_qualifying_items(self):
+        cfg = {"key": "K", "min_compare_at": 800}
+        _, sent = self._send([self._alert(self.LUXE, self.CHEAP)], cfg)
+        self.assertIn("Manolo Blahnik", sent[0][1]["body"])
+        self.assertNotIn("Resin Ring", sent[0][1]["body"])
+
+    def test_alert_without_items_still_pushes(self):
+        """COUNT_UP 这类没有商品，不该被门槛误杀"""
+        a = Alert("COUNT_UP", "总数大幅上涨", "总数 8,805 (+240)")
+        _, sent = self._send([a], {"key": "K", "min_compare_at": 800})
+        self.assertEqual(len(sent), 1)
+        self.assertIn("8,805", sent[0][1]["body"])
+
+    def test_network_failure_is_returned_not_raised(self):
+        """推送挂了绝不能让抓取崩掉，也不能静默"""
+        def boom(req, timeout=None):
+            raise urllib.error.URLError("no route to host")
+        with patch("urllib.request.urlopen", boom):
+            err = notify.send_bark([self._alert(self.LUXE)], {"key": "K"})
+        self.assertIn("Bark", err)
+
+    def test_server_error_code_is_reported(self):
+        err, _ = self._send([self._alert(self.LUXE)],
+                            resp=_FakeResp(b'{"code":400,"message":"key invalid"}'))
+        self.assertIn("key invalid", err)
+
+    def test_custom_server_is_honoured(self):
+        _, sent = self._send([self._alert(self.LUXE)],
+                             {"key": "K", "server": "https://bark.me/"})
+        self.assertEqual(sent[0][0], "https://bark.me/K")
+
+    def test_disabled_channel_is_skipped(self):
+        with patch.object(notify, "send_bark") as spy:
+            notify.dispatch([self._alert(self.LUXE)],
+                            {"macos": {"enabled": False}, "bark": {"enabled": False}})
+            spy.assert_not_called()
+
+
+class TestEmailPerItemLinks(unittest.TestCase):
+    """
+    邮件里每件商品都要带自己的链接。
+
+    回归：一条 "前 15 名进了 7 件新货" 的告警只带一个 url（最便宜那件），
+    收到邮件根本看不出另外 6 件具体是什么东西。
+    """
+
+    ITEMS = (
+        Item("1", "Blade Bomber Jacket", "Save The Duck", 70.18, 328.0, 78,
+             "https://r.com/s/blade/1", True, 1, "low-inventory", ("NEW_MARKDOWN",)),
+        Item("2", 'Set of 3 "Clover" Studs & Co', "Adornia", 19.98, 295.0, 93,
+             "https://r.com/s/clover/2", True, 5, None, ("FINAL_SALE",)),
+    )
+
+    def _alert(self):
+        return Alert("TOP_N_NEW", "前 15 名进了 2 件新货", "正文",
+                     self.ITEMS[0].url, True, "1", self.ITEMS)
+
+    def test_text_carries_every_url(self):
+        out = notify.render_text([self._alert()])
+        for it in self.ITEMS:
+            self.assertIn(it.url, out, f"{it.title} 的链接丢了")
+            self.assertIn(it.label(), out)
+
+    def test_html_has_one_anchor_per_item(self):
+        out = notify.render_html([self._alert()])
+        for it in self.ITEMS:
+            self.assertIn(f'href="{it.url}"', out, f"{it.title} 的链接丢了")
+        self.assertEqual(out.count("<a href="), len(self.ITEMS))
+
+    def test_html_escapes_item_titles(self):
+        """商品名里的 & 和引号必须转义，否则 HTML 会裂开"""
+        out = notify.render_html([self._alert()])
+        self.assertIn("&amp;", out)
+        self.assertIn("&quot;Clover&quot;", out)
+        self.assertNotIn('Studs & Co', out)
+
+    def test_price_and_flags_rendered(self):
+        for render in (notify.render_text, notify.render_html):
+            out = render([self._alert()])
+            self.assertIn("$70.18", out)
+            self.assertIn("93% off", out)
+            self.assertIn("可直邮仅剩 1 件", out)
+
+    def test_alert_without_items_falls_back_to_body(self):
+        """COUNT_UP 这类只报数量的告警没有商品，要原样呈现 body"""
+        a = Alert("COUNT_UP", "总数大幅上涨", "总数 8,805 (+120)")
+        self.assertIn("总数 8,805 (+120)", notify.render_text([a]))
+        self.assertIn("总数 8,805 (+120)", notify.render_html([a]))
+
+    def test_body_is_not_polluted_with_urls(self):
+        """
+        链接只进邮件，不进 Alert.body —— body 是 macOS 通知气泡用的，
+        塞 URL 会把它撑爆，而且 body 还会原样落进 event 表。
+        """
+        obs = _obs()
+        prev = _Row(primary_item_id="OLD", primary_title="Old", primary_price=30.0,
+                    total_count=9000)
+        (alert,) = _build_alerts(obs, prev, 0, 0, ALERT_CFG,
+                                 new_in_top=[obs.primary])
+        self.assertNotIn("https://", alert.body)
+
+    def test_build_alerts_attaches_items(self):
+        """告警构造时就要把商品挂上，否则邮件无从渲染"""
+        obs = _obs()
+        prev = _Row(primary_item_id="OLD", primary_title="Old", primary_price=30.0,
+                    total_count=9000)
+        (alert,) = _build_alerts(obs, prev, 0, 0, ALERT_CFG,
+                                 new_in_top=[obs.primary])
+        self.assertEqual(alert.kind, "PRIMARY_CHANGED")
+        self.assertEqual([i.item_id for i in alert.items], ["A"])
+
+    def test_rule_match_attaches_all_hits(self):
+        hits = list(self.ITEMS)
+        obs = _obs()
+        prev = _Row(primary_item_id="A", primary_title="Thing", primary_price=19.98,
+                    total_count=9000)
+        alerts = _build_alerts(obs, prev, 0, 0, ALERT_CFG,
+                               rule_hits={"深折扣薄库存": hits})
+        (rule_alert,) = [a for a in alerts if a.kind == "RULE_MATCH"]
+        self.assertEqual([i.item_id for i in rule_alert.items], ["1", "2"])
+        out = notify.render_html([rule_alert])
+        self.assertEqual(out.count("<a href="), 2)
+
+
+class TestPrimarySwitchesAreIndependent(unittest.TestCase):
+    """
+    回归：primary_changed 和 primary_price_drop 是两个独立开关。
+
+    原先外层 if 用的是 primary_changed，关掉"榜首换人"会把"榜首降价"
+    一起静默掉 —— 关一个却停了两个，排查时不会有人想到这里。
+    """
+
+    def test_price_drop_survives_changed_off(self):
+        cfg = {**ALERT_CFG, "primary_changed": False, "primary_price_drop": True}
+        prev = _Row(primary_item_id="A", primary_title="Thing", primary_price=39.98,
+                    total_count=9000)
+        kinds = [a.kind for a in _build_alerts(_obs(), prev, 0, 0, cfg)]
+        self.assertEqual(kinds, ["PRIMARY_PRICE_DROP"])
+
+    def test_changed_off_silences_changed(self):
+        cfg = {**ALERT_CFG, "primary_changed": False}
+        obs = _obs()
+        prev = _Row(primary_item_id="OLD", primary_title="Old", primary_price=30.0,
+                    total_count=9000)
+        kinds = [a.kind for a in _build_alerts(obs, prev, 0, 0, cfg,
+                                               new_in_top=[obs.primary])]
+        self.assertNotIn("PRIMARY_CHANGED", kinds)
+
+    def test_changed_survives_price_drop_off(self):
+        cfg = {**ALERT_CFG, "primary_price_drop": False}
+        obs = _obs()
+        prev = _Row(primary_item_id="OLD", primary_title="Old", primary_price=30.0,
+                    total_count=9000)
+        kinds = [a.kind for a in _build_alerts(obs, prev, 0, 0, cfg,
+                                               new_in_top=[obs.primary])]
+        self.assertEqual(kinds, ["PRIMARY_CHANGED"])
+
+    def test_both_off_is_silent(self):
+        cfg = {**ALERT_CFG, "primary_changed": False, "primary_price_drop": False}
+        prev = _Row(primary_item_id="A", primary_title="Thing", primary_price=39.98,
+                    total_count=9000)
+        self.assertEqual(_build_alerts(_obs(), prev, 0, 0, cfg), [])
+
+
+class TestAlertContext(unittest.TestCase):
+    """
+    带商品的告警，邮件里也要保留商品之外的上下文。
+
+    回归：改成逐件渲染商品后，邮件不再呈现 body，于是"榜首换人"丢掉了
+    "上一个是谁"这行 —— 只知道现在榜首是什么，不知道它顶掉了什么。
+    """
+
+    def _primary_changed(self):
+        obs = _obs()
+        prev = _Row(primary_item_id="OLD", primary_title="Halogen Ribbed Sweater",
+                    primary_price=4.29, total_count=9000)
+        (alert,) = _build_alerts(obs, prev, 0, 0, ALERT_CFG,
+                                 new_in_top=[obs.primary])
+        return alert
+
+    def test_primary_changed_carries_previous_item(self):
+        a = self._primary_changed()
+        self.assertEqual(a.kind, "PRIMARY_CHANGED")
+        self.assertIn("Halogen Ribbed Sweater", a.context)
+        self.assertIn("$4.29", a.context)
+
+    def test_context_reaches_both_email_bodies(self):
+        a = self._primary_changed()
+        for render in (notify.render_text, notify.render_html):
+            out = render([a])
+            self.assertIn("Halogen Ribbed Sweater", out, f"{render.__name__} 丢了上下文")
+            self.assertIn("Thing", out, "商品本身也要在")
+
+    def test_price_drop_keeps_previous_price(self):
+        """商品行只有现价和站点原价，看不出相对上一轮降了多少"""
+        obs = _obs()
+        prev = _Row(primary_item_id="A", primary_title="Thing", primary_price=39.98,
+                    total_count=9000)
+        (alert,) = _build_alerts(obs, prev, 0, 0, ALERT_CFG)
+        self.assertEqual(alert.kind, "PRIMARY_PRICE_DROP")
+        self.assertIn("$39.98", alert.context)
+        self.assertIn("$39.98", notify.render_html([alert]))
+
+    def test_item_listing_alerts_have_no_context(self):
+        """TOP_N_NEW / RULE_MATCH 的 body 全是商品信息，没有额外上下文可留"""
+        obs = _obs()
+        prev = _Row(primary_item_id="A", primary_title="Thing", primary_price=19.98,
+                    total_count=9000)
+        alerts = _build_alerts(obs, prev, 0, 0, {**ALERT_CFG, "top_n_new": True},
+                               new_in_top=[obs.primary],
+                               rule_hits={"规则": [obs.primary]})
+        for a in alerts:
+            self.assertEqual(a.context, "", f"{a.kind} 不该有 context")
+
+    def test_context_is_escaped_in_html(self):
+        a = self._primary_changed()
+        a.context = 'Tommy & Co <b>"x"</b>'
+        out = notify.render_html([a])
+        self.assertIn("&amp;", out)
+        self.assertNotIn("<b>", out)
+
+
+class TestTestNotifySamples(unittest.TestCase):
+    """
+    回归：test-notify 的样例商品必须是库里的真货。
+
+    手写样例害人——实测手写的 pid 是从日志随手抄的，它属于另一件商品，
+    点进去是条连衣裙而标题写着耳钉，看上去完全像"链接和标题对不上"的 bug。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "t.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _record(self, it):
+        obs = _obs(item=it)
+        self.store.record(obs, _to_local(obs.ts, None), primary_changed=False,
+                          track_items=True)
+
+    def test_returns_real_stored_items(self):
+        it = Item("8240372", "Balloon Sleeve Midi Dress", "Eliza J",
+                  39.98, 158.0, 75, "https://r.com/s/balloon-sleeve-midi/8240372")
+        self._record(it)
+        (got,) = self.store.recent_items(3)
+        self.assertEqual(got.item_id, "8240372")
+        self.assertEqual(got.title, "Balloon Sleeve Midi Dress")
+        self.assertIn("8240372", got.url, "链接里的 pid 必须和商品本身一致")
+
+    def test_url_and_title_come_from_same_row(self):
+        """两件商品不能串台"""
+        self._record(Item("111", "Aviator Sunglasses", "Vince Camuto", 29.98,
+                          98.0, 69, "https://r.com/s/vince-camuto-aviator/111"))
+        self._record(Item("222", "Clover Stud Earrings", "Adornia", 19.98,
+                          295.0, 93, "https://r.com/s/adornia-clover/222"))
+        for it in self.store.recent_items(5):
+            self.assertIn(it.item_id, it.url,
+                          f"{it.title} 配到了别人的链接: {it.url}")
+
+    def test_empty_db_yields_no_samples(self):
+        """库是空的就不给商品，绝不编一个"""
+        self.assertEqual(self.store.recent_items(3), [])
 
 
 class TestEmailPassword(unittest.TestCase):

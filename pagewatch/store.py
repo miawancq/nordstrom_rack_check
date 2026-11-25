@@ -220,14 +220,48 @@ class Store:
         )
         return cur.fetchone()
 
-    def recent_counts(self, watcher: str, limit: int = 10) -> list[int]:
-        """最近若干次可信抓取的总数，用于算中位数做异常判定"""
+    def last_snapshot_any(self, watcher: str) -> sqlite3.Row | None:
+        """
+        取紧邻的上一次成功抓取，**不管它可不可信**。
+
+        这是可信度判定专用的参照物，和 last_snapshot 的用途正好相反：
+        判定要问的是"这一轮和上一轮长得像不像"，而不是"和最后一个好的像不像"。
+        必须包含不可信的记录，否则站点换了水位之后，每一轮都在和那个
+        再也不会回来的旧快照比，会被永久判为异常 —— 实测 2026-11-12 就是
+        这样卡死 13 个小时、一条告警都没发出来。
+
+        拿紧邻的上一轮当参照，站点真换了水位时第二轮就能自己恢复。
+        """
         cur = self._conn.execute(
-            "SELECT total_count FROM snapshot WHERE watcher=? AND ok=1 AND anomalous=0"
-            " AND total_count IS NOT NULL ORDER BY id DESC LIMIT ?",
-            (watcher, limit),
+            "SELECT * FROM snapshot WHERE watcher=? AND ok=1 "
+            "ORDER BY id DESC LIMIT 1",
+            (watcher,),
         )
-        return [int(r[0]) for r in cur]
+        return cur.fetchone()
+
+    def recent_items(self, limit: int = 3) -> list[Item]:
+        """
+        最近见过的若干件真实商品，给 test-notify 当样例用。
+
+        测试通知必须用真货：编造的 title/url 组合会让人以为"链接和标题对不上"
+        是程序 bug —— 实测踩过，样例里的 pid 是从日志里随手抄的，
+        它属于另一件商品，点进去是条连衣裙而标题写着耳钉。
+        """
+        cur = self._conn.execute(
+            "SELECT item_id, title, brand, price, compare_at, pct_off, url, shippable"
+            " FROM item WHERE url IS NOT NULL AND title IS NOT NULL"
+            " ORDER BY last_seen DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            Item(
+                item_id=r["item_id"], title=r["title"], brand=r["brand"],
+                price=r["price"], compare_at=r["compare_at"], pct_off=r["pct_off"],
+                url=r["url"],
+                shippable=None if r["shippable"] is None else bool(r["shippable"]),
+            )
+            for r in cur
+        ]
 
     def snapshot_count(self, watcher: str) -> int:
         """该 watcher 已有的成功抓取次数，用于判断是否还在预热期"""

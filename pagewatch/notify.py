@@ -12,16 +12,20 @@
 from __future__ import annotations
 
 import contextlib
+import html
 import os
 import signal
+import json
 import smtplib
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
-from .models import Alert
+from .models import Alert, Item
 
 
 def _osascript_escape(s: str) -> str:
@@ -331,6 +335,183 @@ def _clean(pw: str) -> str:
     return "".join(str(pw).split())
 
 
+#: Bark 推送的超时。比邮件短得多 —— 它的全部价值就是"人不在电脑旁时手机能响"，
+#: 为一条推送阻塞住后面的邮件不值得。
+BARK_TIMEOUT = 10.0
+
+
+def _bark_items(a: Alert, min_compare_at: float | None) -> list[Item]:
+    """
+    这条告警里够格推手机的商品。
+
+    min_compare_at 为空（默认）就是全推。设了值则只留原价达标的那些 ——
+    实测按现有规则每天会产生 15~35 条告警，醒着的时候平均 45 分钟响一次，
+    全推到锁屏上大概率会被静音，那这个渠道就白做了。
+    把门槛放在这里而不是改规则，是因为邮件要继续收全量：
+    手机负责"现在就得看"，邮件负责"回头翻"。
+    """
+    if not min_compare_at:
+        return list(a.items)
+    return [i for i in a.items
+            if i.compare_at is not None and i.compare_at >= min_compare_at]
+
+
+def _bark_body(items: list[Item], fallback: str) -> str:
+    """
+    推送正文。价格放最前面 —— 锁屏上只扫一眼，先看到的应该是"多少钱"。
+    """
+    if not items:
+        return fallback
+    lines = []
+    for it in items:
+        bits = [f"${it.price:,.2f}" if it.price is not None else "价格未知"]
+        if it.pct_off is not None:
+            bits.append(f"{it.pct_off}% off")
+        bits.append(it.label())
+        lines.append(" · ".join(bits))
+    return "\n".join(lines)
+
+
+def send_bark(alerts: list[Alert], cfg: dict[str, Any]) -> str | None:
+    """
+    推送到 Bark（iOS）。成功返回 None，失败返回错误描述。
+
+    一条告警推一条通知，不合并 —— Bark 一条通知只能挂一个 URL，
+    合并之后点开只能到其中一件，不如分开推、各自可点。
+
+    cfg: key（设备码，必填）/ server / group / sound / min_compare_at
+    """
+    key = str(cfg.get("key") or "").strip()
+    if not key:
+        return "Bark 未配置 key（跳过发送）"
+    server = str(cfg.get("server") or "https://api.day.app").rstrip("/")
+    min_compare_at = cfg.get("min_compare_at")
+    min_compare_at = float(min_compare_at) if min_compare_at else None
+
+    problems: list[str] = []
+    for a in alerts:
+        items = _bark_items(a, min_compare_at)
+        # 带商品的告警，一件都不达标就整条跳过；本来就没商品的（COUNT_UP）照推
+        if a.items and not items:
+            continue
+        payload: dict[str, Any] = {
+            "title": a.title,
+            "body": _bark_body(items, a.body),
+            # 同一个 watcher 的推送在通知中心归成一组，不会刷屏
+            "group": str(cfg.get("group") or "page-watch"),
+            # timeSensitive 能穿透专注模式 —— 这个渠道存在的理由就是别错过
+            "level": "timeSensitive" if a.urgent else "passive",
+        }
+        url = (items[0].url if items else None) or a.url
+        if url:
+            payload["url"] = url
+        if sound := cfg.get("sound"):
+            payload["sound"] = str(sound)
+
+        req = urllib.request.Request(
+            f"{server}/{key}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=BARK_TIMEOUT) as resp:
+                raw = resp.read(500).decode(errors="replace")
+            body = json.loads(raw)
+            if int(body.get("code", 0)) != 200:
+                problems.append(f"Bark 返回 {body.get('code')}: {body.get('message')}")
+        except urllib.error.HTTPError as exc:
+            problems.append(f"Bark HTTP {exc.code}: {exc.reason}")
+        except (urllib.error.URLError, OSError) as exc:
+            problems.append(f"Bark 请求失败: {type(exc).__name__}: {exc}")
+        except (ValueError, TypeError) as exc:
+            problems.append(f"Bark 响应解析失败: {exc}")
+
+    return "; ".join(problems) if problems else None
+
+
+def render_text(alerts: list[Alert]) -> str:
+    """
+    邮件的纯文本正文：每件商品一行，**紧跟自己的链接**。
+
+    Alert.body 本身只有商品名和价格，没有链接 —— 它是给 macOS 通知用的，
+    塞几条 URL 进去会把气泡撑爆。所以带商品的告警在这里用 items 重新渲染，
+    不复用 body；没有商品的（COUNT_UP 之类）才退回 body。
+    """
+    blocks: list[str] = []
+    for a in alerts:
+        lines = [f"[{a.kind}] {a.title}"]
+        if a.items:
+            for it in a.items:
+                lines.append("")
+                lines.append(f"  {it.label()}")
+                flags = it.flags()
+                lines.append(f"  {it.price_line()}" + (f"  ·  {flags}" if flags else ""))
+                if it.url:
+                    lines.append(f"  {it.url}")
+            if a.context:
+                lines.append("")
+                lines.append(a.context)
+        else:
+            lines.append(a.body)
+            if a.url:
+                lines.append(a.url)
+        blocks.append("\n".join(lines))
+    return "\n\n---\n\n".join(blocks)
+
+
+def _item_html(it: Item) -> str:
+    """单件商品的 HTML：商品名就是链接，下面一行价格和状态"""
+    name = html.escape(it.label())
+    link = (f'<a href="{html.escape(it.url, quote=True)}"'
+            f' style="color:#0b63ce;text-decoration:none;font-weight:600">{name}</a>'
+            if it.url else f'<span style="font-weight:600">{name}</span>')
+    bits = [f'<span style="color:#111">{html.escape(it.price_line())}</span>']
+    if flags := it.flags():
+        # 库存紧张之类的提示用橙色，一眼能从价格里区分出来
+        bits.append(f'<span style="color:#b35309">{html.escape(flags)}</span>')
+    return (
+        '<tr><td style="padding:8px 0;border-bottom:1px solid #eee">'
+        f'{link}<br>'
+        f'<span style="font-size:13px">{"&nbsp;·&nbsp;".join(bits)}</span>'
+        '</td></tr>'
+    )
+
+
+def render_html(alerts: list[Alert]) -> str:
+    """
+    邮件的 HTML 正文：每件商品渲染成一个可点的超链接。
+
+    样式全部内联 —— Gmail 会把 <style> 块整个丢掉。
+    """
+    blocks: list[str] = []
+    for a in alerts:
+        head = (f'<div style="font-weight:600;font-size:15px;margin:0 0 6px">'
+                f'{html.escape(a.title)}</div>'
+                f'<div style="font-size:12px;color:#888;margin:0 0 10px">'
+                f'{html.escape(a.kind)}</div>')
+        if a.items:
+            rows = "".join(_item_html(it) for it in a.items)
+            body = f'<table style="width:100%;border-collapse:collapse">{rows}</table>'
+            if a.context:
+                body += (f'<div style="margin-top:8px;font-size:13px;color:#666">'
+                         f'{html.escape(a.context)}</div>')
+        else:
+            # 没有商品的告警（只报数量）原样呈现 body，保留换行
+            body = (f'<div style="white-space:pre-wrap">{html.escape(a.body)}</div>')
+            if a.url:
+                body += (f'<div style="margin-top:6px"><a href='
+                         f'"{html.escape(a.url, quote=True)}">打开页面</a></div>')
+        blocks.append(f'<div style="margin:0 0 26px">{head}{body}</div>')
+
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+        'Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#222">'
+        + "".join(blocks) +
+        '</div>'
+    )
+
+
 def send_email(alerts: list[Alert], cfg: dict[str, Any]) -> str | None:
     """
     把本次所有告警合成一封邮件发出。成功返回 None，失败返回错误描述。
@@ -345,16 +526,17 @@ def send_email(alerts: list[Alert], cfg: dict[str, Any]) -> str | None:
         return f"邮件配置不完整，缺少: {', '.join(missing)}（跳过发送）"
 
     subject = alerts[0].title if len(alerts) == 1 else f"{len(alerts)} 条页面变化告警"
-    parts = []
-    for a in alerts:
-        parts.append(f"[{a.kind}] {a.title}\n{a.body}" + (f"\n{a.url}" if a.url else ""))
 
     msg = EmailMessage()
     msg["Subject"] = f"[page-watch] {subject}"
     msg["From"] = cfg["from"]
     recipients = [t.strip() for t in str(cfg["to"]).split(",") if t.strip()]
     msg["To"] = ", ".join(recipients)
-    msg.set_content("\n\n---\n\n".join(parts))
+    # 两份正文：纯文本兜底，HTML 让每件商品各自可点。
+    # set_content + add_alternative 会自动组成 multipart/alternative，
+    # 客户端挑一份渲染 —— Gmail 取 HTML，纯文本客户端取前者。
+    msg.set_content(render_text(alerts))
+    msg.add_alternative(render_html(alerts), subtype="html")
 
     port = int(cfg.get("port", 587))
     is_gmail = "gmail" in str(cfg.get("host", "")).lower()
@@ -435,6 +617,12 @@ def dispatch(
             err = send_macos_merged(alerts, sound=sound)
             if err:
                 problems.append(err)
+
+    bark_cfg = notify_cfg.get("bark", {})
+    if bark_cfg.get("enabled", False):
+        err = send_bark(alerts, bark_cfg)
+        if err:
+            problems.append(err)
 
     email_cfg = notify_cfg.get("email", {})
     if email_cfg.get("enabled", False):

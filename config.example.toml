@@ -51,6 +51,36 @@ to = "你的@gmail.com"   # 自己发给自己，Gmail 会正常进收件箱
 use_keychain = false  # 用明文密码。想改用钥匙串就设 true 再跑 setup-email
 
 
+# ============ Bark 推送（iOS 手机）============
+#
+# 人不在电脑旁时，邮件不会在手机上弹出来，所以单开一个走 APNs 的渠道。
+#
+# 怎么拿 key：App Store 装 Bark → 打开 app → 首页那串
+# https://api.day.app/XXXXXXXX/ 里的 XXXXXXXX 就是设备码，填到下面 key。
+#
+# 注意 key 等同于"谁都能往你手机推送"的凭据，和 SMTP 密码一样属于机密。
+# config.toml 已在 .gitignore 里，不会进版本库。
+[notify.bark]
+enabled = false            # 填好 key 之后改成 true
+key = ""                   # ← 只需要改这一行
+server = "https://api.day.app"   # 自建 bark-server 就改这里
+group = "page-watch"       # 通知中心里归组，不刷屏
+# 留空 = 不指定，用 Bark app 里自己的默认铃声（实测够响，就用它）。
+# 想换成固定铃声就填名字，32 个内置音见 github.com/Finb/Bark/tree/master/Sounds
+sound = ""
+
+# 手机推送的额外门槛：只推原价 ≥ 这个数的商品，邮件不受影响仍收全量。
+# 留空/0 = 和邮件一样全推（当前就是这样）。
+#
+# 实测数据：按现在的规则每天 15~35 条告警，醒着时平均 45 分钟响一次。
+# 真嫌吵就把这行打开，几个档位的实测命中量（11-14 以来）：
+#   原价 >= 250   约 18 条/天
+#   原价 >= 500   约  9 条/天
+#   原价 >= 800   约  6 条/天   ← Manolo Blahnik $29、Alaïa $54 这个级别
+#   原价 >= 1000  约  3 条/天
+min_compare_at = 0
+
+
 # ======================================================================
 # Watcher 1：榜首监控（这是你真正要的 alert）
 #
